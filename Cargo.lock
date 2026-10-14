@@ -5215,6 +5215,7 @@ dependencies = [
  "ravel-codec",
  "ravel-commit",
  "ravel-cpu-gate",
+ "ravel-esql",
  "ravel-logseg",
  "ravel-maintain",
  "ravel-memory",
