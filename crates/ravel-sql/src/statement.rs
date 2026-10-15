@@ -366,10 +366,7 @@ fn lowered_tables(target: StatementTarget) -> Result<StatementTables, SqlError> 
         StatementTarget::Signal(TargetSignal::Parquet) => Err(SqlError::PlanNotAdmitted(
             "a signal target named the Parquet target".to_string(),
         )),
-        StatementTarget::Signal(signal) => Ok(StatementTables {
-            signal: Some(signal),
-            others: BTreeSet::new(),
-        }),
+        StatementTarget::Signal(signal) => Ok(StatementTables::one(Some(signal))),
         StatementTarget::Parquet(names) => {
             if names.is_empty() {
                 return Err(SqlError::PlanNotAdmitted(
@@ -388,14 +385,14 @@ fn lowered_tables(target: StatementTarget) -> Result<StatementTables, SqlError> 
                 });
             }
             Ok(StatementTables {
-                signal: None,
+                signals: Vec::new(),
                 others: names,
             })
         }
     }
 }
 
-fn signal_table(name: &str) -> Option<TargetSignal> {
+pub(crate) fn signal_table(name: &str) -> Option<TargetSignal> {
     match name {
         SAMPLES_TABLE => Some(TargetSignal::Metrics),
         LOGS_TABLE => Some(TargetSignal::Logs),
@@ -406,7 +403,7 @@ fn signal_table(name: &str) -> Option<TargetSignal> {
     }
 }
 
-fn signal_table_name(signal: TargetSignal) -> Option<&'static str> {
+pub(crate) fn signal_table_name(signal: TargetSignal) -> Option<&'static str> {
     match signal {
         TargetSignal::Metrics => Some(SAMPLES_TABLE),
         TargetSignal::Logs => Some(LOGS_TABLE),
@@ -420,9 +417,12 @@ fn signal_table_name(signal: TargetSignal) -> Option<&'static str> {
 /// The table names `tables` admits a scan of.
 fn target_table_names(tables: &StatementTables) -> BTreeSet<&str> {
     let mut names: BTreeSet<&str> = tables.others.iter().map(String::as_str).collect();
-    if let Some(name) = tables.signal.and_then(signal_table_name) {
-        names.insert(name);
-    }
+    names.extend(
+        tables
+            .signals
+            .iter()
+            .filter_map(|signal| signal_table_name(*signal)),
+    );
     names
 }
 
@@ -764,7 +764,7 @@ mod tests {
 
     fn parquet_tables(names: &[&str]) -> StatementTables {
         StatementTables {
-            signal: None,
+            signals: Vec::new(),
             others: names.iter().map(|name| (*name).to_string()).collect(),
         }
     }
