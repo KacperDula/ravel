@@ -83,33 +83,36 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p <your-crate>        # plus --workspace when your change is cross-crate
 ```
 
-Those do not cover `ravel-server`'s SQL and Flight SQL surfaces: both sit
-behind cargo features that are off by default. `cargo test -p ravel-server`
-compiles neither. A `--workspace` run that builds test
+Those do not cover `ravel-server`'s SQL, Flight SQL and ES|QL surfaces: all
+three sit behind cargo features that are off by default. `cargo test -p
+ravel-server` compiles none of them. A `--workspace` run that builds test
 targets (`cargo clippy --workspace --all-targets`, `cargo test --workspace`,
 `cargo nextest run --workspace`) does compile the SQL surface, because
 `ravel-cli` has a dev-dependency on `ravel-server` with the `sql` feature and
 cargo unifies features across what it builds. A workspace run that builds no
 test targets does not: `cargo check --workspace` and `cargo build --workspace`
 leave dev-dependencies out, so they check `ravel-server` without `sql`. None
-of the three commands above compiles Flight SQL or the ravel-bench features,
-and none builds `ravel-server` with `sql` selected on its own, without the
+of the three commands above compiles Flight SQL, ES|QL or the ravel-bench
+features, and none builds `ravel-server` with `sql` selected on its own, without the
 dependency features the rest of the workspace adds. (CI's `all-features` job
 type-checks every feature at once with clippy; it runs no tests and is not
 one of the local gates.) When your change touches
-`ravel-server`, `ravel-sql`, or `ravel-query`, add:
+`ravel-server`, `ravel-sql`, `ravel-esql`, or `ravel-query`, add:
 
 ```sh
 cargo clippy -p ravel-server --features sql --all-targets -- -D warnings
 cargo test   -p ravel-server --features sql
 cargo clippy -p ravel-server -p ravel-sql --features flight-sql --all-targets -- -D warnings
 cargo test   -p ravel-server -p ravel-sql --features flight-sql
+cargo clippy -p ravel-server --features esql --all-targets -- -D warnings
+cargo test   -p ravel-server --features esql
 ```
 
 `scripts/gates.sh` runs these when the crates are in scope. In scoped mode
 (`-p CRATE`) scope is the reverse-dependency closure of the named crates:
-the `sql` lane runs when ravel-server is in it and the `flight-sql` lane
-when ravel-sql or ravel-server is, so `-p ravel-query` runs both. A fleet
+the `sql` lane runs when ravel-server is in it, the `flight-sql` lane
+when ravel-sql or ravel-server is, and the `esql` lane when ravel-esql,
+ravel-sql or ravel-server is, so `-p ravel-query` runs all three. A fleet
 executor's gate is `scripts/gates.sh -p <crate> [-p <crate2>]`, not a
 hand-listed workspace clippy, and the PreToolUse hook refuses `cargo
 clippy --workspace` in a fleet clone. gates.sh also runs a
@@ -125,8 +128,8 @@ builds them as dependencies and cargo never compiles a dependency's
 gates.sh also runs a `-p ravel-cli --features sql-explain` clippy and test
 lane whenever ravel-cli is in scope, matching CI's `features` job. Do
 not skip them: a workspace gate can print "All gates passed" on a tree where
-a feature lane fails. For `flight-sql` and the ravel-bench features that is
-because the default workspace gate never compiles them. For `sql` it is
+a feature lane fails. For `flight-sql`, `esql` and the ravel-bench features
+that is because the default workspace gate never compiles them. For `sql` it is
 because the
 workspace run builds `ravel-server` with the dependency features the rest of
 the workspace adds, so a break that only appears with `sql` selected on its
@@ -227,9 +230,10 @@ connection, a pushed-but-broken main).
   args runs the full workspace gate; `-p CRATE` (repeatable) scopes
   clippy/test/doc to the named crates and every workspace crate that
   depends on them, transitively (the closure `affected-tests.sh -n`
-  prints). It also runs the `sql` and `flight-sql` feature lanes, always
-  in workspace mode, and in scoped mode `sql` when `ravel-server` is in
-  the closure and `flight-sql` when `ravel-sql` or `ravel-server` is.
+  prints). It also runs the `sql`, `flight-sql` and `esql` feature lanes,
+  always in workspace mode, and in scoped mode `sql` when `ravel-server`
+  is in the closure, `flight-sql` when `ravel-sql` or `ravel-server` is,
+  and `esql` when `ravel-esql`, `ravel-sql` or `ravel-server` is.
   This is the executor's gate in fleet specs. A scoped run writes no
   gates-pass receipt. `--dry-run` prints the closure and every cargo
   command the same arguments would run, then exits 0 without building;
@@ -389,9 +393,9 @@ connection, a pushed-but-broken main).
   for the named crates plus every workspace crate that depends on them
   (transitively), with the `ci` cargo profile; `-n` prints the affected
   set without running. When ravel-server is in the closure it also runs
-  `-p ravel-server --features sql`, and when ravel-sql or ravel-server
-  is, `-p ravel-server -p ravel-sql --features flight-sql`, on the same
-  profile. Full-workspace tests still run at merge time
+  `-p ravel-server --features sql` and `-p ravel-server --features
+  esql`, and when ravel-sql or ravel-server is, `-p ravel-server -p
+  ravel-sql --features flight-sql`, on the same profile. Full-workspace tests still run at merge time
   (verify-dispatch-gates.sh and PR CI), so executors only pay for the
   blast radius of their change; fleet specs gate with `scripts/gates.sh
   -p`, which reads its closure from this script's `-n`. Doctests included
@@ -778,6 +782,26 @@ than passing for "no pull request open".
   anchor, which is the case where the scan would otherwise pass everything.
   Wired into `gates.sh` and CI's doc-scripts job; cases in
   `scripts/guards/check-guarded-sql-parse.test.sh`.
+- `scripts/guards/check-guarded-esql-parse.sh [crate-root caller-root ...]`:
+  exits non-zero when ES|QL source text could enter `ravel-esql` other than
+  through `ravel_esql::parse` and `ravel_esql::lex`, the two entries that apply
+  the byte and token limits (and, for `parse`, the nesting and stage limits)
+  before the recursive parser runs (issue #2892). Under
+  `crates/ravel-esql/src/` it refuses a bare-`pub` function, a `pub trait`
+  method, or a `FromStr`/`From`/`TryFrom` impl that takes `str`, `String`,
+  `[u8]`, `Read` or `BufRead`, or lexed tokens (a slice, `Vec` or iterator of
+  `Token`, by any path), since a function over tokens would run the parser
+  without the nesting and stage limits; a bare `pub` in a private module
+  counts, so internal helpers say `pub(crate)`. Under `crates/ravel-sql/src/`
+  and `services/ravel-server/src/` it refuses any path through the crate's
+  `lexer` or `parser` module that does not end at `parse`, `lex`, or an alias
+  the crate declares of one of them (`lexer::tokenize`). Its suppression
+  marker is its own, `// guarded-esql-parse-allow: <reason>`, with the reason
+  required; the SQL guard's marker does not silence it. Exit 1 is a finding; 2 is a missing anchor (`pub fn parse`
+  in parser.rs or `pub fn lex` in lexer.rs gone, duplicated, or no longer
+  read as taking text, or no caller naming either), a missing default root,
+  or no sources. Wired into `gates.sh` and CI's doc-scripts job; cases in
+  `scripts/guards/check-guarded-esql-parse.test.sh`.
 - `scripts/guards/check-promql-unreachable.sh [path ...]`: exits non-zero when
   an `unreachable!` under `crates/ravel-promql/src/` carries no
   `// unreachable-allow: <arm> -- <reason>` marker, on its own line or in the

@@ -4616,7 +4616,9 @@ name = "ravel-esql"
 version = "0.24.0"
 dependencies = [
  "proptest",
+ "ravel-promql",
  "thiserror",
+ "toml",
 ]
 
 [[package]]
@@ -5127,6 +5129,7 @@ dependencies = [
  "ravel-catalog",
  "ravel-commit",
  "ravel-cpu-gate",
+ "ravel-esql",
  "ravel-fleet",
  "ravel-ingest",
  "ravel-logseg",
