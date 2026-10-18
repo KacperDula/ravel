@@ -39,6 +39,7 @@ pub mod ingest_byte_metrics;
 pub mod ingest_concurrency;
 pub mod ingest_decode;
 pub mod ingest_mode;
+pub mod ipcrypt;
 pub mod lifecycle_refresh;
 pub mod logs_ingest;
 pub mod maintain;
@@ -1823,6 +1824,7 @@ fn gateway_state(
     write_gate: &Arc<ravel_cpu_gate::WriteGate>,
     max_ingest_lag_ns: i64,
     strict_flush_policy: config::StrictFlushPolicy,
+    ipcrypt: &Arc<ipcrypt::IpcryptPolicy>,
 ) -> Arc<otlp_http::GatewayState> {
     Arc::new(otlp_http::GatewayState {
         tenant_resolver,
@@ -1839,6 +1841,7 @@ fn gateway_state(
             metadata_sink: metadata_sink.clone(),
             normalize_metrics: normalize_reject_metrics.clone(),
             budget: ingest_buffer_budget.clone(),
+            ipcrypt: ipcrypt.clone(),
         },
         logs_ingest: logs_ingest::LogIngestState {
             router: log_ingest_router.clone(),
@@ -1853,6 +1856,7 @@ fn gateway_state(
             provisioning: provisioning.clone(),
             normalize_metrics: normalize_reject_metrics.clone(),
             budget: ingest_buffer_budget.clone(),
+            ipcrypt: ipcrypt.clone(),
         },
         traces_ingest: traces_ingest::SpanIngestState {
             router: span_ingest_router.clone(),
@@ -1867,6 +1871,7 @@ fn gateway_state(
             provisioning: provisioning.clone(),
             normalize_metrics: normalize_reject_metrics.clone(),
             budget: ingest_buffer_budget.clone(),
+            ipcrypt: ipcrypt.clone(),
         },
         admission: admission.clone(),
         budget: ingest_buffer_budget.clone(),
@@ -1890,6 +1895,8 @@ fn remote_write_state(
     write_gate: &Arc<ravel_cpu_gate::WriteGate>,
     max_ingest_lag_ns: i64,
     strict_flush_policy: config::StrictFlushPolicy,
+    normalize_reject_metrics: &Arc<normalize_reject_metrics::NormalizeRejectMetrics>,
+    ipcrypt: &Arc<ipcrypt::IpcryptPolicy>,
 ) -> Arc<remote_write::RemoteWriteState> {
     Arc::new(remote_write::RemoteWriteState {
         tenant_resolver,
@@ -1909,6 +1916,8 @@ fn remote_write_state(
         budget: ingest_buffer_budget.clone(),
         write_gate: Some(write_gate.clone()),
         strict_flush_policy,
+        ipcrypt: ipcrypt.clone(),
+        normalize_metrics: normalize_reject_metrics.clone(),
     })
 }
 
@@ -2315,15 +2324,38 @@ pub async fn start(
     store_metrics: Arc<StoreMetrics>,
     cache: Option<ravel_query::ReadCache>,
 ) -> anyhow::Result<Running> {
+    start_with_ipcrypt(
+        config,
+        store,
+        store_background,
+        store_metrics,
+        cache,
+        ipcrypt::IpcryptPolicy::disabled(),
+    )
+    .await
+}
+
+/// [`start`] under an IPCrypt policy (ADR-2993): `ipcrypt` is the parsed
+/// `--ipcrypt-config`, already validated against the deployment key by
+/// [`ipcrypt::IpcryptPolicy::new`]. [`start`] is this with the empty policy.
+pub async fn start_with_ipcrypt(
+    config: ServerConfig,
+    store: Arc<dyn ObjectStoreBackend>,
+    store_background: Arc<dyn ObjectStoreBackend>,
+    store_metrics: Arc<StoreMetrics>,
+    cache: Option<ravel_query::ReadCache>,
+    ipcrypt: Arc<ipcrypt::IpcryptPolicy>,
+) -> anyhow::Result<Running> {
     let heartbeat = health_listener::Heartbeat::new(Arc::new(SystemClock));
     let task = AbortOnDrop(heartbeat.spawn());
-    let mut running = start_with_heartbeat(
+    let mut running = start_with_heartbeat_and_ipcrypt(
         config,
         store,
         store_background,
         store_metrics,
         cache,
         heartbeat,
+        ipcrypt,
     )
     .await?;
     running.runtime_heartbeat_task = Some(task);
@@ -2334,12 +2366,40 @@ pub async fn start(
 /// renders its age as `ravel_health_heartbeat_age_seconds`; the caller keeps
 /// its task running until after [`Running::shutdown`].
 pub async fn start_with_heartbeat(
+    config: ServerConfig,
+    store: Arc<dyn ObjectStoreBackend>,
+    store_background: Arc<dyn ObjectStoreBackend>,
+    store_metrics: Arc<StoreMetrics>,
+    cache: Option<ravel_query::ReadCache>,
+    heartbeat: health_listener::Heartbeat,
+) -> anyhow::Result<Running> {
+    start_with_heartbeat_and_ipcrypt(
+        config,
+        store,
+        store_background,
+        store_metrics,
+        cache,
+        heartbeat,
+        ipcrypt::IpcryptPolicy::disabled(),
+    )
+    .await
+}
+
+/// [`start_with_heartbeat`] under an IPCrypt policy: the entry point the
+/// binary uses, and the one every other `start` variant delegates to.
+///
+/// In the `all` and `gateway` modes this checks the policy's fingerprint
+/// against the bucket's `sys/ipcrypt/policy` marker before anything is
+/// built or bound, and refuses to start on a mismatch or a failed read
+/// (ADR-2993 decision 9); see [`ipcrypt::check_startup_marker`].
+pub async fn start_with_heartbeat_and_ipcrypt(
     mut config: ServerConfig,
     store: Arc<dyn ObjectStoreBackend>,
     store_background: Arc<dyn ObjectStoreBackend>,
     store_metrics: Arc<StoreMetrics>,
     cache: Option<ravel_query::ReadCache>,
     heartbeat: health_listener::Heartbeat,
+    ipcrypt: Arc<ipcrypt::IpcryptPolicy>,
 ) -> anyhow::Result<Running> {
     validate_idle_flush_byte_floor(&config)?;
     // The same checks, in the same order, as `Cli::validate`.
@@ -2364,6 +2424,8 @@ pub async fn start_with_heartbeat(
     // installed (harmless and possible when a process builds an S3/TLS client
     // first), so the result is discarded.
     let _ = rustls::crypto::ring::default_provider().install_default();
+
+    ipcrypt::check_startup_marker(store.as_ref(), config.mode, &ipcrypt).await?;
 
     // The process-wide ingest buffer byte budget (ADR-0069 decision 1). One
     // gauge shared by `Arc` across the metrics, log, and span routers so a
@@ -2790,6 +2852,7 @@ pub async fn start_with_heartbeat(
             &cpu_gates.write,
             ingest_lag.admission_lag_ns,
             config.strict_flush_policy,
+            &ipcrypt,
         );
         http_router = http_router.merge(otlp_http::router(state));
         let rw_state = remote_write_state(
@@ -2804,6 +2867,8 @@ pub async fn start_with_heartbeat(
             &cpu_gates.write,
             ingest_lag.admission_lag_ns,
             config.strict_flush_policy,
+            &normalize_reject_metrics,
+            &ipcrypt,
         );
         http_router = http_router.merge(remote_write::router(rw_state));
 
@@ -2825,6 +2890,7 @@ pub async fn start_with_heartbeat(
                 &cpu_gates.write,
                 ingest_lag.admission_lag_ns,
                 config.strict_flush_policy,
+                &ipcrypt,
             );
             let mtls_rw_state = remote_write_state(
                 router,
@@ -2838,6 +2904,8 @@ pub async fn start_with_heartbeat(
                 &cpu_gates.write,
                 ingest_lag.admission_lag_ns,
                 config.strict_flush_policy,
+                &normalize_reject_metrics,
+                &ipcrypt,
             );
             mtls_router = mtls_router
                 .merge(otlp_http::router(mtls_state))
@@ -3836,6 +3904,7 @@ pub async fn start_with_heartbeat(
             &cpu_gates.write,
             ingest_lag.admission_lag_ns,
             config.strict_flush_policy,
+            &ipcrypt,
         )),
         _ => None,
     };
